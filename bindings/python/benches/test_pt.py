@@ -2,8 +2,8 @@ import os
 import tempfile
 
 import pytest
-import torch
 
+import torch
 from safetensors.torch import load_file, save_file
 
 
@@ -52,6 +52,19 @@ def test_pt_pt_load_cpu(benchmark):
 
 
 def test_pt_sf_load_cpu(benchmark):
+    # benchmark something
+    weights = create_gpt2(12)
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        save_file(weights, f.name)
+        result = benchmark(load_file, f.name)
+    os.unlink(f.name)
+
+    for k, v in weights.items():
+        tv = result[k]
+        assert torch.allclose(v, tv)
+
+
+def test_concurrent_load(benchmark):
     # benchmark something
     weights = create_gpt2(12)
     with tempfile.NamedTemporaryFile(delete=False) as f:

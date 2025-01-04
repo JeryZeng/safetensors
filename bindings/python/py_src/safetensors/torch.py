@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
-from safetensors import deserialize, safe_open, serialize, serialize_file
+from safetensors import deserialize, safe_open, serialize, serialize_file, deserialize_file_concurrently
 
 
 def storage_ptr(tensor: torch.Tensor) -> int:
@@ -342,6 +342,10 @@ def load(data: bytes) -> Dict[str, torch.Tensor]:
     flat = deserialize(data)
     return _view2torch(flat)
 
+
+def load_file_concurrently(filename: Union[str, os.PathLike], thread_count: int):
+    flat = deserialize_file_concurrently(filename, thread_count)
+    return _view2torch(flat)
 
 # torch.float8 formats require 2.1; we do not support these dtypes on earlier versions
 _float8_e4m3fn = getattr(torch, "float8_e4m3fn", None)

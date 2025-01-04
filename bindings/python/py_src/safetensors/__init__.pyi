@@ -15,6 +15,19 @@ def deserialize(bytes):
     """
     pass
 
+
+@staticmethod
+def deserialize_file_concurrently(file_path, thread_count):
+    """
+    read a safetensors file concurrently and return tensors data
+    Returns:
+        (:obj:`List[str, Dict[str, Dict[str, any]]]`):
+            The deserialized content is like:
+                [("tensor_name", {"shape": [2, 3], "dtype": "F32", "data": b"\0\0.." }), (...)]
+    """
+    pass
+
+
 @staticmethod
 def serialize(tensor_dict, metadata=None):
     """
@@ -32,6 +45,7 @@ def serialize(tensor_dict, metadata=None):
             The serialized content.
     """
     pass
+
 
 @staticmethod
 def serialize_file(tensor_dict, filename, metadata=None):
@@ -52,6 +66,7 @@ def serialize_file(tensor_dict, filename, metadata=None):
             The serialized content.
     """
     pass
+
 
 class safe_open:
     """

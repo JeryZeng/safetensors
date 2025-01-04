@@ -1,5 +1,7 @@
 #![deny(missing_docs)]
 //! Dummy doc
+#[cfg(unix)]
+use libc;
 use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::prelude::*;
@@ -10,13 +12,20 @@ use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
-use safetensors::View;
+use safetensors::{SafeTensorError, View};
 use std::borrow::Cow;
+use std::cmp::{max, min};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::iter::FromIterator;
 use std::ops::Bound;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 
 static TORCH_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
@@ -24,6 +33,13 @@ static NUMPY_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static TENSORFLOW_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static FLAX_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static MLX_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
+
+
+/// 获取当前时间
+#[macro_export]
+macro_rules! current_time {
+    () => {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as f64 / 1000.};
+}
 
 struct PyView<'a> {
     shape: Vec<usize>,
@@ -187,6 +203,257 @@ fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String
     }
     Ok(items)
 }
+
+
+#[derive(Debug)]
+struct TensorBlock<'data> {
+    start: usize,
+    end: usize,
+    size: usize,
+    tensor_count: usize,
+    index: usize,
+    tensors: Vec<(&'data TensorInfo, &'data String)>,
+}
+unsafe impl<'data> Send for TensorBlock<'data> {}
+
+impl<'data> TensorBlock<'data> {
+    fn new(index: usize) -> Self {
+        TensorBlock {
+            tensors: Vec::new(),
+            start: 0,
+            index,
+            end: 0,
+            size: 0,
+            tensor_count: 0,
+        }
+    }
+
+    pub fn add_tensor(&mut self, tensor: &'data TensorInfo, name: &'data String) {
+        self.tensors.push((tensor, name));
+        self.start = self.tensors[0].0.data_offsets.0;
+        self.end = self.tensors.last().unwrap().0.data_offsets.1;
+        self.size = self.end - self.start;
+        self.tensor_count += 1;
+    }
+
+    ///
+    /// read block tensors as PyByteArray
+    ///
+    pub fn read_tensors(&self, file_path: &String, interrupted: &Arc<AtomicBool>, offset: usize) -> Result<Vec<PyObject>, SafeTensorError>
+    {
+        // self.read_by_mmap(file_path, interrupted, offset)
+        self.read_by_direct_io(file_path, interrupted, offset)
+    }
+
+    fn read_by_mmap(&self, file_path: &String, interrupted: &Arc<AtomicBool>, offset: usize) -> Result<Vec<PyObject>, SafeTensorError> {
+        let file = File::open(file_path).map_err(|e| SafeTensorError::IoError(e))?;
+        let buffer = unsafe { MmapOptions::new().map(&file).map_err(|e| SafeTensorError::IoError(e))? };
+        let mut result: Vec<PyObject> = Vec::with_capacity(self.tensors.len());
+        for (tensor, _) in &self.tensors {
+            if interrupted.load(SeqCst) {
+                return Ok(result);
+            }
+            let py_data: PyObject = Python::with_gil(|py| {
+                PyByteArray::new_bound_with(py, tensor.data_offsets.1 - tensor.data_offsets.0, |x| {
+                    Python::allow_threads(py, || x.copy_from_slice(&buffer[tensor.data_offsets.0 + offset..tensor.data_offsets.1 + offset]));
+                    Ok(())
+                }).unwrap().into()
+            });
+            result.push(py_data);
+        }
+        Ok(result)
+    }
+
+    fn read_by_direct_io(&self, file_path: &String, interrupted: &Arc<AtomicBool>, offset: usize) -> Result<Vec<PyObject>, SafeTensorError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        if cfg!(unix) {
+            #[cfg(unix)]
+            options.custom_flags(libc::O_DIRECT);
+        }
+
+        let mut file = options.open(file_path).map_err(|e| SafeTensorError::IoError(e))?;
+        file.seek(SeekFrom::Start((self.start + offset) as u64)).map_err(|e| SafeTensorError::IoError(e))?;
+
+        let tensor_count = self.tensors.len();
+        let mut result: Vec<PyObject> = Vec::with_capacity(tensor_count);
+        let read_buffer_size = 1024 * 1024;
+
+        let mut read_start = 0;
+        let mut read_end = 0;
+        for (tensor, _) in &self.tensors {
+            if interrupted.load(SeqCst) {
+                return Ok(result);
+            }
+            let tensor_size = tensor.data_offsets.1 - tensor.data_offsets.0;
+            read_start = 0;
+            read_end = min(read_buffer_size, tensor_size);
+            let byarr: PyObject = Python::with_gil(|py| {
+                PyByteArray::new_bound_with(py, tensor_size, |x| {
+                    Python::allow_threads(py, || {
+                        loop {
+                            let read = file.read(&mut x[read_start..read_end]).map_err(|e| SafeTensorError::IoError(e))?;
+                            read_start += read;
+                            if read_start >= tensor_size {
+                                break;
+                            }
+                            read_end = min(read_start + read_buffer_size, tensor_size);
+                        }
+                        Ok(())
+                    }).map_err(|e: SafeTensorError| SafetensorError::new_err(format!("Deserialize safetensors to PyByteArray error:{:?}", e)))
+                }).unwrap().into()
+            });
+            result.push(byarr);
+        }
+        Ok(result)
+    }
+}
+
+fn split_tensor_to_blocks<'a>(data_len: usize, tensor_map: &'a HashMap<String, &'a TensorInfo>, thread_count: usize) -> Result<Vec<TensorBlock<'a>>, SafeTensorError> {
+    //分区重排，单个block最小64M
+    let block_size = max(data_len / thread_count, 1024 * 1024 * 16);
+    let mut tensors: Vec<(&String, &TensorInfo, usize)> = tensor_map.iter().map(|(name, info)| (name, *info, info.data_offsets.1 - info.data_offsets.0)).collect();
+
+    tensors.sort_by(|(_, a, _), (_, b, _)| a.data_offsets.cmp(&b.data_offsets));
+
+    let mut all_blocks: Vec<TensorBlock> = Vec::with_capacity(thread_count);
+
+    let mut block_index = 0;
+    for (name, tensor_info, _) in tensors {
+        if all_blocks.len() == 0 {
+            let _block = TensorBlock::new(block_index);
+            block_index += 1;
+            all_blocks.push(_block);
+        } else if all_blocks.len() < thread_count {
+            let last = all_blocks.last().unwrap();
+            if last.size > block_size {
+                let _block = TensorBlock::new(block_index);
+                block_index += 1;
+                all_blocks.push(_block);
+            }
+        }
+        let block: &mut TensorBlock = all_blocks.last_mut().unwrap();
+        block.add_tensor(tensor_info, name);
+    }
+
+    Ok(all_blocks)
+}
+
+
+fn format_size(size_in_bytes: usize) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut index = 0;
+    let mut size_in_bytes = size_in_bytes as f64;
+    while size_in_bytes >= 1024. && index < units.len() - 1 {
+        size_in_bytes /= 1024.0;
+        index += 1;
+    }
+    format!("{:.2}{}", size_in_bytes, units[index])
+}
+
+fn read_tensors_concurrently(file_path: &String, all_blocks: &Vec<TensorBlock>, offset: usize)
+                             -> Result<Vec<Vec<PyObject>>, SafeTensorError> {
+    let block_count = all_blocks.len();
+    println!("total block count is:{}", block_count);
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let datas = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(block_count);
+        let total_start_time = current_time!();
+        for index in 0..block_count {
+            let block = all_blocks.get(index).unwrap();
+            handles.push(s.spawn(|| {
+                let start_time = current_time!();
+                match block.read_tensors(file_path, &interrupt, offset) {
+                    Ok(result) => {
+                        println!("block [{}:{}] read finish in {:.2}s", block.index, format_size(block.size), current_time!() - start_time);
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        interrupt.store(true, SeqCst);
+                        Err(e)
+                    }
+                }
+            }));
+        }
+        let mut all_tensor_datas = Vec::with_capacity(block_count);
+        let mut error: Option<SafeTensorError> = None;
+        let mut total_read_size = 0;
+        let mut index: i32 = -1;
+        for handle in handles {
+            index += 1;
+            match handle.join().unwrap() {
+                Ok(data) => {
+                    match error {
+                        None => {
+                            total_read_size += all_blocks[index as usize].size;
+                            all_tensor_datas.push(data);
+                        }
+                        Some(_) => {}
+                    }
+                }
+                Err(e) => {
+                    match error {
+                        None => error = Some(e),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        println!("total read finish in {:.2}s,read speed:{}", current_time!() - total_start_time, format_size(total_read_size));
+        match error {
+            None => Ok(all_tensor_datas),
+            Some(e) => Err(e)
+        }
+    })?;
+    Ok(datas)
+}
+
+
+#[pyfunction]
+#[pyo3(signature = (file_path,thread_count))]
+fn deserialize_file_concurrently(py: Python, file_path: String, thread_count: usize) -> PyResult<Vec<(String, HashMap<String, PyObject>)>> {
+    // 读取元数据
+    let buffer = unsafe { MmapOptions::new().map(&File::open(&file_path)?)? };
+    let (meta_len, metadata) = SafeTensors::read_metadata(&buffer)
+        .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e:?}")))?;
+    let data_len = buffer.len() - meta_len - 8;
+    drop(buffer);
+
+    let tensors = metadata.tensors();
+    let all_blocks = split_tensor_to_blocks(data_len, &tensors, thread_count)
+        .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e:?}")))?;
+
+    let mut datas = Python::allow_threads(py, || read_tensors_concurrently(&file_path, &all_blocks, meta_len + 8))
+        .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e:?}")))?;
+
+    let block_count = all_blocks.len();
+
+    let mut items = Vec::with_capacity(tensors.len());
+
+
+    for block_index in 0..block_count {
+        let block = all_blocks.get(block_index).unwrap();
+        let block_data = datas.get_mut(block_index).unwrap();
+        for tensor_index in 0..block.tensors.len() {
+            let reverse_index = block.tensors.len() - 1 - tensor_index;
+            let (tensor, name) = block.tensors[reverse_index];
+            let pyshape = PyList::new_bound(py, tensor.shape.iter()).into();
+            let pydtype: PyObject = format!("{:?}", tensor.dtype).into_py(py);
+            let pydata: PyObject = block_data.remove(reverse_index);
+
+            let map = HashMap::from([
+                ("shape".to_string(), pyshape),
+                ("dtype".to_string(), pydtype),
+                ("data".to_string(), pydata),
+            ]);
+            items.push((name.into(), map));
+        }
+    }
+
+
+    Ok(items)
+}
+
 
 fn slice_to_indexer(
     (dim_idx, (slice_index, dim)): (usize, (SliceIndex, usize)),
@@ -516,7 +783,7 @@ impl Open {
     /// ```
     pub fn get_tensor(&self, name: &str) -> PyResult<PyObject> {
         let info = self.metadata.info(name).ok_or_else(|| {
-            SafetensorError::new_err(format!("File does not contain tensor {name}",))
+            SafetensorError::new_err(format!("File does not contain tensor {name}", ))
         })?;
         // let info = tensors.get(name).ok_or_else(|| {
         //     SafetensorError::new_err(format!("File does not contain tensor {name}",))
@@ -779,7 +1046,7 @@ enum Slice<'a> {
     Slices(Vec<SliceIndex<'a>>),
 }
 
-use std::fmt;
+
 struct Disp(Vec<TensorIndexer>);
 
 /// Should be more readable that the standard
@@ -901,7 +1168,7 @@ impl PySafeSlice {
                             }
                             Ok(())
                         })?
-                        .into_py(py);
+                            .into_py(py);
                     create_tensor(
                         &self.framework,
                         self.info.dtype,
@@ -1017,7 +1284,7 @@ fn create_tensor<'a>(
                 TORCH_MODULE
                     .get(py)
                     .ok_or_else(|| {
-                        SafetensorError::new_err(format!("Could not find module {framework:?}",))
+                        SafetensorError::new_err(format!("Could not find module {framework:?}", ))
                     })?
                     .bind(py),
                 false,
@@ -1026,7 +1293,7 @@ fn create_tensor<'a>(
                 NUMPY_MODULE
                     .get(py)
                     .ok_or_else(|| {
-                        SafetensorError::new_err(format!("Could not find module {framework:?}",))
+                        SafetensorError::new_err(format!("Could not find module {framework:?}", ))
                     })?
                     .bind(py),
                 true,
@@ -1049,7 +1316,7 @@ fn create_tensor<'a>(
                 (intern!(py, "buffer"), array),
                 (intern!(py, "dtype"), dtype),
             ]
-            .into_py_dict_bound(py);
+                .into_py_dict_bound(py);
             let mut tensor = module.call_method("frombuffer", (), Some(&kwargs))?;
             let sys = PyModule::import_bound(py, intern!(py, "sys"))?;
             let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
@@ -1069,7 +1336,7 @@ fn create_tensor<'a>(
                     let module = PyModule::import_bound(py, intern!(py, "jax"))?;
                     Ok(FLAX_MODULE.get_or_init(py, || module.into()))
                 })?
-                .bind(py);
+                    .bind(py);
                 module
                     .getattr(intern!(py, "numpy"))?
                     .getattr(intern!(py, "array"))?
@@ -1080,7 +1347,7 @@ fn create_tensor<'a>(
                     let module = PyModule::import_bound(py, intern!(py, "tensorflow"))?;
                     Ok(TENSORFLOW_MODULE.get_or_init(py, || module.into()))
                 })?
-                .bind(py);
+                    .bind(py);
                 module
                     .getattr(intern!(py, "convert_to_tensor"))?
                     .call1((tensor,))?
@@ -1090,7 +1357,7 @@ fn create_tensor<'a>(
                     let module = PyModule::import_bound(py, intern!(py, "mlx"))?;
                     Ok(MLX_MODULE.get_or_init(py, || module.into()))
                 })?
-                .bind(py);
+                    .bind(py);
                 module
                     .getattr(intern!(py, "core"))?
                     // .getattr(intern!(py, "array"))?
@@ -1169,6 +1436,7 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
+    m.add_function(wrap_pyfunction!(deserialize_file_concurrently, m)?)?;
     m.add_class::<safe_open>()?;
     m.add(
         "SafetensorError",
@@ -1195,5 +1463,29 @@ mod tests {
         let torch_version = "something";
         let version = Version::from_string(torch_version);
         assert!(version.is_err());
+    }
+
+    #[test]
+    fn concurrency_read() {
+        // 读取元数据
+        let file_path = "".to_string();
+        let thread_count = 16;
+        // 读取元数据
+        // 读取元数据
+        let start_time = current_time!();
+        let buffer = unsafe { MmapOptions::new().map(&File::open(&file_path).unwrap()).unwrap() };
+        let (meta_len, metadata) = SafeTensors::read_metadata(&buffer)
+            .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e:?}"))).unwrap();
+        let data_len = buffer.len() - meta_len;
+        drop(buffer);
+        println!("read metadata cost {:.2}s", current_time!() - start_time);
+        let tensors = metadata.tensors();
+        let blocks = split_tensor_to_blocks(data_len, &tensors, thread_count).unwrap();
+        for block in &blocks {
+            println!("{}\t{}", block.tensor_count, (block.size as f64) / 1024. / 1024.);
+        }
+        for block in &blocks {
+            block.read_tensors(&file_path, &Arc::new(AtomicBool::new(false)), meta_len + 8).unwrap();
+        }
     }
 }
